@@ -13,8 +13,14 @@ results/
 queue/
 
 # Agent prompt files (generated per-session by launchers)
-CLAUDE.md
 AGENTS.md
 
 # Experimental code/artifacts
 dev/
+
+# Portfolio research
+.env
+.DS_Store
+best_model.pt
+train.py.best
+run.log

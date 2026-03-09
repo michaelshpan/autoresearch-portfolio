@@ -1,403 +1,511 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
-
-Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
-
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+prepare.py — Data loading, feature engineering, and evaluation utilities.
+DO NOT MODIFY. The autonomous agent only modifies train.py.
 """
 
 import os
 import sys
-import time
-import math
-import argparse
-import pickle
-from multiprocessing import Pool
+import json
+import warnings
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from datetime import datetime
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
-import torch
+warnings.filterwarnings("ignore")
 
-def verify_macos_env():
-    import sys
-    if sys.platform != "darwin":
-        raise RuntimeError(f"This script requires macOS with Metal. Detected platform: {sys.platform}")
-    if not torch.backends.mps.is_available():
-        raise RuntimeError("MPS (Metal Performance Shaders) is not available. Ensure you are running on Apple Silicon with a compatible PyTorch build.")
-    print("Environment verified: macOS detected with Metal (MPS) hardware acceleration available.")
-    print()
+# ─────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────
 
-verify_macos_env()
+DATA_DIR = Path("data")
+RUNS_DIR = Path("runs")
+RUNS_DIR.mkdir(exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
-# ---------------------------------------------------------------------------
+FUNDS = ["Mgr_A", "Mgr_B", "Mgr_C", "Mgr_LS"]
+TRAIN_END = "2025-Q2"       # last quarter used for training
+VAL_QUARTER = "2025-Q3"     # validation quarter
+TEST_QUARTER = "2025-Q4"    # held-out ground truth
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+# Trade direction thresholds (default, can be overridden in train.py)
+BUY_THRESHOLD = 0.5   # weight increase > 0.5pp → BUY
+SELL_THRESHOLD = -0.5  # weight decrease < -0.5pp → SELL
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+TIME_BUDGET_SECONDS = 600  # 10 minutes
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
-
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
-
-# ---------------------------------------------------------------------------
-# Data download
-# ---------------------------------------------------------------------------
-
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+# Quarter ordering for sequencing
+QUARTER_ORDER = [
+    "2019-Q3", "2019-Q4",
+    "2020-Q1", "2020-Q2", "2020-Q3", "2020-Q4",
+    "2021-Q1", "2021-Q2", "2021-Q3", "2021-Q4",
+    "2022-Q1", "2022-Q2", "2022-Q3", "2022-Q4",
+    "2023-Q1", "2023-Q2", "2023-Q3", "2023-Q4",
+    "2024-Q1", "2024-Q2", "2024-Q3", "2024-Q4",
+    "2025-Q1", "2025-Q2", "2025-Q3", "2025-Q4",
+]
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
+# ─────────────────────────────────────────────
+# Data Loading
+# ─────────────────────────────────────────────
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
-
-
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
-
-
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
-
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
-
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
-
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
-
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
-    )
-
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
-
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
-
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
-
-# ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
-# ---------------------------------------------------------------------------
-
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def load_holdings():
+    """Load quarterly holdings for all four managers.
+    Aggregates duplicate tickers (e.g. multiple _Private entries) within each fund-quarter.
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
+    df = pd.read_csv(DATA_DIR / "holdings_quarterly_fin.csv")
+    df["pct_weight"] = pd.to_numeric(df["pct_weight"], errors="coerce")
+    df["dollar_value"] = pd.to_numeric(df["dollar_value"], errors="coerce")
+    df["shares"] = pd.to_numeric(df["shares"], errors="coerce")
+
+    # Aggregate duplicates: sum weights/shares/dollars, keep first sector/cusip/security_name
+    agg = df.groupby(["fund_ticker", "report_date", "quarter", "ticker"]).agg({
+        "security_name": "first",
+        "sector": "first",
+        "cusip": "first",
+        "shares": "sum",
+        "pct_weight": "sum",
+        "dollar_value": "sum",
+    }).reset_index()
+
+    return agg
+
+
+def load_benchmark_holdings():
+    """Load VONG (R1000G proxy) quarterly holdings — the investable universe.
+    Aggregates duplicate tickers within each quarter.
     """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
+    df = pd.read_csv(DATA_DIR / "holdings_vong.csv")
+    df["pct_weight"] = pd.to_numeric(df["pct_weight"], errors="coerce")
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
+    agg = df.groupby(["fund_ticker", "report_date", "quarter", "ticker"]).agg({
+        "security_name": "first",
+        "sector": "first",
+        "cusip": "first",
+        "shares": "sum",
+        "pct_weight": "sum",
+        "dollar_value": "sum",
+    }).reset_index()
 
-    # Detect device
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    return agg
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=(device=="cuda"))
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
 
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
+def load_nav():
+    """Load daily NAV series for all four managers."""
+    df = pd.read_csv(DATA_DIR / "portfolio_daily_nav_fin.csv", parse_dates=["Date"])
+    df.set_index("Date", inplace=True)
+    return df
 
-                remaining = row_capacity - pos
 
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
+def load_benchmark_prices():
+    """Load daily benchmark prices (R3000, R1000G)."""
+    df = pd.read_csv(DATA_DIR / "benchmark_daily_prices.csv", parse_dates=["Date"])
+    df.set_index("Date", inplace=True)
+    return df
 
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
+
+def load_ff_factors():
+    """Load Fama-French 5 factors + momentum, merged into a single daily DataFrame."""
+    # FF5 — skip header rows
+    ff5_raw = pd.read_csv(DATA_DIR / "F-F_Research_Data_5_Factors_2x3_daily.csv", skiprows=4)
+    ff5_raw.columns = [c.strip() for c in ff5_raw.columns]
+    first_col = ff5_raw.columns[0]
+    ff5_raw = ff5_raw[ff5_raw[first_col].apply(lambda x: str(x).strip().isdigit())]
+    ff5_raw["Date"] = pd.to_datetime(ff5_raw[first_col].astype(str).str.strip(), format="%Y%m%d")
+    ff5_raw = ff5_raw.drop(columns=[first_col])
+    for col in ff5_raw.columns:
+        if col != "Date":
+            ff5_raw[col] = pd.to_numeric(ff5_raw[col], errors="coerce")
+    ff5_raw.set_index("Date", inplace=True)
+
+    # Momentum
+    mom_raw = pd.read_csv(DATA_DIR / "F-F_Momentum_Factor_daily.csv", skiprows=14)
+    mom_raw.columns = [c.strip() for c in mom_raw.columns]
+    first_col = mom_raw.columns[0]
+    mom_raw = mom_raw[mom_raw[first_col].apply(lambda x: str(x).strip().isdigit())]
+    mom_raw["Date"] = pd.to_datetime(mom_raw[first_col].astype(str).str.strip(), format="%Y%m%d")
+    mom_raw = mom_raw.drop(columns=[first_col])
+    mom_raw.rename(columns={mom_raw.columns[0]: "MOM"}, inplace=True)
+    mom_raw["MOM"] = pd.to_numeric(mom_raw["MOM"], errors="coerce")
+    mom_raw.set_index("Date", inplace=True)
+
+    factors = ff5_raw.join(mom_raw, how="inner")
+    return factors
+
+
+def load_qualitative_features():
+    """
+    Parse qualitative markdown files into a structured dict per manager.
+    Returns dict: {fund_ticker: qualitative_text}
+    """
+    qual = {}
+    for fund in FUNDS:
+        path = DATA_DIR / f"{fund} - Qualitative_fin.md"
+        if path.exists():
+            qual[fund] = path.read_text(encoding="utf-8")
+        else:
+            qual[fund] = ""
+    return qual
+
+
+def load_quantitative_features():
+    """
+    Parse quantitative markdown files into a structured dict per manager.
+    Returns dict: {fund_ticker: quantitative_text}
+    """
+    quant = {}
+    for fund in FUNDS:
+        path = DATA_DIR / f"{fund} - Quantitative.md"
+        if path.exists():
+            quant[fund] = path.read_text(encoding="utf-8")
+        else:
+            quant[fund] = ""
+    return quant
+
+
+# ─────────────────────────────────────────────
+# Feature Engineering Utilities
+# ─────────────────────────────────────────────
+
+def compute_returns(nav_df):
+    """Compute daily returns from NAV series."""
+    return nav_df.pct_change().dropna()
+
+
+def compute_rolling_factor_betas(nav_df, factors_df, window=60):
+    """
+    Compute rolling OLS factor betas for each fund against FF6 factors.
+    Returns dict: {fund: DataFrame of rolling betas}
+    """
+    returns = compute_returns(nav_df)
+    # Align dates
+    common_idx = returns.index.intersection(factors_df.index)
+    returns = returns.loc[common_idx]
+    factors = factors_df.loc[common_idx]
+
+    factor_cols = [c for c in factors.columns if c != "RF"]
+    betas = {}
+
+    for fund in FUNDS:
+        if fund not in returns.columns:
+            continue
+        excess_ret = returns[fund] - factors["RF"] / 100  # RF is in percent
+        fund_betas = pd.DataFrame(index=common_idx, columns=factor_cols, dtype=float)
+
+        for i in range(window, len(common_idx)):
+            y = excess_ret.iloc[i - window:i].values
+            X = factors[factor_cols].iloc[i - window:i].values / 100
+            X = np.column_stack([np.ones(len(X)), X])
+            try:
+                beta = np.linalg.lstsq(X, y, rcond=None)[0]
+                fund_betas.iloc[i] = beta[1:]  # exclude intercept
+            except Exception:
+                pass
+
+        fund_betas = fund_betas.dropna()
+        betas[fund] = fund_betas
+
+    return betas
+
+
+def build_trade_labels(holdings_df, buy_thresh=BUY_THRESHOLD, sell_thresh=SELL_THRESHOLD):
+    """
+    Build trade direction labels between consecutive quarters.
+    Returns DataFrame with columns: fund_ticker, quarter, ticker, prev_weight,
+    curr_weight, weight_change, direction (0=SELL, 1=HOLD, 2=BUY)
+    """
+    records = []
+    for fund in FUNDS:
+        fund_df = holdings_df[holdings_df["fund_ticker"] == fund].copy()
+        quarters = sorted(fund_df["quarter"].unique(), key=lambda q: QUARTER_ORDER.index(q))
+
+        for i in range(1, len(quarters)):
+            prev_q = quarters[i - 1]
+            curr_q = quarters[i]
+
+            prev = fund_df[fund_df["quarter"] == prev_q][["ticker", "pct_weight"]].set_index("ticker")
+            curr = fund_df[fund_df["quarter"] == curr_q][["ticker", "pct_weight"]].set_index("ticker")
+
+            all_tickers = sorted(set(prev.index) | set(curr.index))
+
+            for tick in all_tickers:
+                pw = prev.loc[tick, "pct_weight"] if tick in prev.index else 0.0
+                cw = curr.loc[tick, "pct_weight"] if tick in curr.index else 0.0
+                change = cw - pw
+
+                if change > buy_thresh:
+                    direction = 2  # BUY
+                elif change < sell_thresh:
+                    direction = 0  # SELL
                 else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
+                    direction = 1  # HOLD
 
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
+                records.append({
+                    "fund_ticker": fund,
+                    "quarter": curr_q,
+                    "ticker": tick,
+                    "prev_weight": pw,
+                    "curr_weight": cw,
+                    "weight_change": change,
+                    "direction": direction,
+                })
 
-# ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
-# ---------------------------------------------------------------------------
+    return pd.DataFrame(records)
 
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+
+def get_universe(benchmark_holdings_df, quarter):
+    """Get the set of tickers in the R1000G benchmark for a given quarter."""
+    qdf = benchmark_holdings_df[benchmark_holdings_df["quarter"] == quarter]
+    return set(qdf["ticker"].unique())
+
+
+def split_data(trade_labels_df):
     """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+    Split trade labels into train, val, test sets based on quarter.
+    Train: all quarters up to and including TRAIN_END
+    Val: VAL_QUARTER
+    Test: TEST_QUARTER
     """
-    device = next(model.parameters()).device
-    token_bytes = get_token_bytes(device=device)
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+    train_quarters = [q for q in QUARTER_ORDER if QUARTER_ORDER.index(q) <= QUARTER_ORDER.index(TRAIN_END)]
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+    train = trade_labels_df[trade_labels_df["quarter"].isin(train_quarters)]
+    val = trade_labels_df[trade_labels_df["quarter"] == VAL_QUARTER]
+    test = trade_labels_df[trade_labels_df["quarter"] == TEST_QUARTER]
+
+    return train, val, test
+
+
+# ─────────────────────────────────────────────
+# Evaluation
+# ─────────────────────────────────────────────
+
+def evaluate(predictions, holdings_df=None, verbose=True):
+    """
+    Evaluate predicted Q4 2025 holdings against ground truth.
+
+    Args:
+        predictions: dict of {fund_ticker: [{"ticker": str, "weight": float}, ...]}
+        holdings_df: if None, loads from disk
+        verbose: print results
+
+    Returns:
+        dict with trade_direction_accuracy, weight_mae, per_fund breakdown
+    """
+    if holdings_df is None:
+        holdings_df = load_holdings()
+
+    results = {}
+    total_correct = 0
+    total_count = 0
+    total_mae = 0.0
+    total_weight_count = 0
+
+    for fund in FUNDS:
+        # Get Q3 2025 (prev) and Q4 2025 (actual) holdings
+        prev = holdings_df[(holdings_df["fund_ticker"] == fund) &
+                           (holdings_df["quarter"] == VAL_QUARTER)][["ticker", "pct_weight"]].set_index("ticker")
+        actual = holdings_df[(holdings_df["fund_ticker"] == fund) &
+                             (holdings_df["quarter"] == TEST_QUARTER)][["ticker", "pct_weight"]].set_index("ticker")
+
+        # Predicted holdings
+        pred_list = predictions.get(fund, [])
+        pred = pd.DataFrame(pred_list).set_index("ticker") if pred_list else pd.DataFrame(columns=["weight"]).rename_axis("ticker")
+        if "weight" in pred.columns:
+            pred = pred.rename(columns={"weight": "pct_weight"})
+
+        # Universe: union of all tickers in prev, actual, and predicted
+        all_tickers = sorted(set(prev.index) | set(actual.index) | set(pred.index))
+
+        correct = 0
+        count = 0
+        mae_sum = 0.0
+
+        for tick in all_tickers:
+            pw = prev.loc[tick, "pct_weight"] if tick in prev.index else 0.0
+            aw = actual.loc[tick, "pct_weight"] if tick in actual.index else 0.0
+            predw = pred.loc[tick, "pct_weight"] if tick in pred.index else 0.0
+
+            # Actual direction
+            actual_change = aw - pw
+            if actual_change > BUY_THRESHOLD:
+                actual_dir = 2
+            elif actual_change < SELL_THRESHOLD:
+                actual_dir = 0
+            else:
+                actual_dir = 1
+
+            # Predicted direction
+            pred_change = predw - pw
+            if pred_change > BUY_THRESHOLD:
+                pred_dir = 2
+            elif pred_change < SELL_THRESHOLD:
+                pred_dir = 0
+            else:
+                pred_dir = 1
+
+            if actual_dir == pred_dir:
+                correct += 1
+            count += 1
+            mae_sum += abs(aw - predw)
+
+        direction_acc = correct / count if count > 0 else 0.0
+        mae = mae_sum / count if count > 0 else 0.0
+
+        results[fund] = {"direction_acc": round(direction_acc, 4), "mae": round(mae, 4)}
+        total_correct += correct
+        total_count += count
+        total_mae += mae_sum
+        total_weight_count += count
+
+    overall_acc = total_correct / total_count if total_count > 0 else 0.0
+    overall_mae = total_mae / total_weight_count if total_weight_count > 0 else 0.0
+
+    output = {
+        "trade_direction_accuracy": round(overall_acc, 4),
+        "weight_mae": round(overall_mae, 4),
+        "per_fund": results,
+    }
+
+    if verbose:
+        print("\n" + "=" * 60)
+        print("EVALUATION RESULTS")
+        print("=" * 60)
+        print(f"  Trade Direction Accuracy:  {output['trade_direction_accuracy']:.4f}")
+        print(f"  Weight MAE:               {output['weight_mae']:.4f}")
+        print()
+        for fund in FUNDS:
+            r = results[fund]
+            print(f"  {fund:8s}  dir_acc={r['direction_acc']:.4f}  mae={r['mae']:.4f}")
+        print("=" * 60)
+
+    return output
+
+
+# ─────────────────────────────────────────────
+# Experiment Logging
+# ─────────────────────────────────────────────
+
+def log_experiment(experiment_id, hypothesis, change_summary, eval_results, wall_clock_seconds, improved):
+    """Append an experiment record to runs/log.jsonl."""
+    record = {
+        "experiment_id": experiment_id,
+        "timestamp": datetime.now().isoformat(),
+        "hypothesis": hypothesis,
+        "change_summary": change_summary,
+        "trade_direction_accuracy": eval_results["trade_direction_accuracy"],
+        "weight_mae": eval_results["weight_mae"],
+        "per_fund": eval_results["per_fund"],
+        "improved": improved,
+        "wall_clock_seconds": round(wall_clock_seconds, 1),
+    }
+    log_path = RUNS_DIR / "log.jsonl"
+    with open(log_path, "a") as f:
+        f.write(json.dumps(record) + "\n")
+    return record
+
+
+def load_experiment_log():
+    """Load all past experiments from log."""
+    log_path = RUNS_DIR / "log.jsonl"
+    if not log_path.exists():
+        return []
+    records = []
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
+def get_next_experiment_id():
+    """Get the next experiment ID."""
+    records = load_experiment_log()
+    if not records:
+        return 1
+    return max(r["experiment_id"] for r in records) + 1
+
+
+# ─────────────────────────────────────────────
+# Device Detection
+# ─────────────────────────────────────────────
+
+def get_device():
+    """Auto-detect best available device: MPS > CUDA > CPU."""
+    import torch
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    elif torch.cuda.is_available():
+        return torch.device("cuda")
+    else:
+        return torch.device("cpu")
+
+
+# ─────────────────────────────────────────────
+# Main: run as one-time data prep / verification
+# ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
-    args = parser.parse_args()
+    print("=" * 60)
+    print("Portfolio Replication — Data Verification")
+    print("=" * 60)
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
+    # Check data files exist
+    required_files = [
+        "holdings_quarterly_fin.csv",
+        "portfolio_daily_nav_fin.csv",
+        "benchmark_daily_prices.csv",
+        "holdings_vong.csv",
+        "F-F_Research_Data_5_Factors_2x3_daily.csv",
+        "F-F_Momentum_Factor_daily.csv",
+    ]
+    for fname in required_files:
+        path = DATA_DIR / fname
+        if path.exists():
+            print(f"  ✓ {fname}")
+        else:
+            print(f"  ✗ {fname} — MISSING")
+            sys.exit(1)
 
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
+    # Load and verify
+    holdings = load_holdings()
+    print(f"\n  Holdings: {len(holdings)} rows, {holdings['fund_ticker'].nunique()} funds, "
+          f"{holdings['quarter'].nunique()} quarters")
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
+    nav = load_nav()
+    print(f"  NAV: {len(nav)} days, columns: {list(nav.columns)}")
 
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    bench = load_benchmark_prices()
+    print(f"  Benchmark: {len(bench)} days, columns: {list(bench.columns)}")
+
+    factors = load_ff_factors()
+    print(f"  FF Factors: {len(factors)} days, columns: {list(factors.columns)}")
+
+    vong = load_benchmark_holdings()
+    print(f"  VONG holdings: {len(vong)} rows")
+
+    # Build trade labels
+    labels = build_trade_labels(holdings)
+    print(f"\n  Trade labels: {len(labels)} rows")
+    print(f"  Direction distribution:")
+    for d, name in [(0, "SELL"), (1, "HOLD"), (2, "BUY")]:
+        count = (labels["direction"] == d).sum()
+        print(f"    {name}: {count} ({count / len(labels) * 100:.1f}%)")
+
+    # Split
+    train, val, test = split_data(labels)
+    print(f"\n  Train: {len(train)} rows (up to {TRAIN_END})")
+    print(f"  Val:   {len(val)} rows ({VAL_QUARTER})")
+    print(f"  Test:  {len(test)} rows ({TEST_QUARTER})")
+
+    # Device
+    try:
+        import torch
+        device = get_device()
+        print(f"\n  Device: {device}")
+    except ImportError:
+        print("\n  PyTorch not installed — skipping device check")
+
+    print("\n" + "=" * 60)
+    print("Data verification complete. Ready to train.")
+    print("=" * 60)
